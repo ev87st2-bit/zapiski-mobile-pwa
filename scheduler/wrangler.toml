@@ -1,0 +1,7 @@
+name = "zapiski-reminder-scheduler"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+account_id = "6212d96e4290607085f8e2a2a58f1504"
+
+[triggers]
+crons = ["* * * * *"]
