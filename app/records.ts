@@ -13,6 +13,8 @@ export interface Entry {
   revisitDate?: string;
   reviewedAt?: string;
   completedAt?: string;
+  sourcePlanId?: string;
+  sourceTaskId?: string;
 }
 
 export const STORAGE_KEY = "zapiski.records.v1";

@@ -3,15 +3,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft, Bell, BellRing, BookOpen, CalendarDays, Check, CheckCircle2, ChevronLeft,
-  ChevronRight, CircleAlert, ClipboardList, FileText, Home, Lightbulb, ListFilter,
-  Mic, MicOff, Pencil, Plus, RotateCcw, Save, Settings2, Trash2, X,
+  ChevronRight, CircleAlert, ClipboardList, FileText, Gift, Home, Lightbulb, ListFilter,
+  Mic, MicOff, Pencil, Plus, RotateCcw, Save, Settings2, Sparkles, Trash2, X,
 } from "lucide-react";
+import AssistantScreen from "./AssistantScreen";
+import { Birthday, birthdayReminderState, birthdaysForDate, readBirthdays } from "./planning";
+import { cancelRemoteReminder, deleteRemoteEntry, getDeviceToken, syncEntry } from "./integrations";
 import {
-  Entry, RecordType, entryIsDue, formatDateKey, formatLongDate, ideaRevisitDate,
-  localDateKey, NOTIFIED_KEY, readEntries, sortEntries, writeEntries,
+  Entry, RecordType, formatDateKey, formatLongDate, ideaRevisitDate,
+  localDateKey, readEntries, sortEntries, writeEntries,
 } from "./records";
 
-type Screen = "today" | "records" | "calendar" | "create" | "editor" | "details";
+type Screen = "today" | "records" | "calendar" | "create" | "editor" | "details" | "assistant";
 type Filter = "all" | RecordType | "completed";
 
 const TYPE_LABELS: Record<RecordType, string> = { note: "Заметка", idea: "Идея", task: "Задача" };
@@ -72,6 +75,7 @@ function EntryCard({ entry, today, onOpen }: { entry: Entry; today: string; onOp
 
 export default function NotesApp() {
   const [entries, setEntries] = useState<Entry[]>([]);
+  const [birthdays, setBirthdays] = useState<Birthday[]>([]);
   const [screen, setScreen] = useState<Screen>("today");
   const [previousScreen, setPreviousScreen] = useState<Screen>("today");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -86,9 +90,6 @@ export default function NotesApp() {
   const [toast, setToast] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [speechState, setSpeechState] = useState<"idle" | "listening" | "unsupported" | "error">("idle");
-  const [permission, setPermission] = useState<NotificationPermission | "unsupported">("default");
-  const [reminderInfo, setReminderInfo] = useState(false);
-  const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const today = localDateKey();
 
@@ -103,15 +104,11 @@ export default function NotesApp() {
   useEffect(() => {
     const hydrationTimer = window.setTimeout(() => {
       setEntries(readEntries());
-      if ("Notification" in window) setPermission(Notification.permission);
-      else setPermission("unsupported");
+      setBirthdays(readBirthdays());
     }, 0);
     if ("serviceWorker" in navigator) navigator.serviceWorker.register(new URL("sw.js", document.baseURI).pathname).catch(() => undefined);
-    const handleInstall = (event: Event) => { event.preventDefault(); setInstallPrompt(event); };
-    window.addEventListener("beforeinstallprompt", handleInstall);
     return () => {
       window.clearTimeout(hydrationTimer);
-      window.removeEventListener("beforeinstallprompt", handleInstall);
     };
   }, []);
 
@@ -120,50 +117,6 @@ export default function NotesApp() {
     const timer = window.setTimeout(() => setToast(""), 2600);
     return () => window.clearTimeout(timer);
   }, [toast]);
-
-  const playReminderSound = useCallback(() => {
-    try {
-      const AudioContextClass = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!AudioContextClass) return;
-      const context = new AudioContextClass();
-      const oscillator = context.createOscillator();
-      const gain = context.createGain();
-      oscillator.frequency.setValueAtTime(660, context.currentTime);
-      oscillator.frequency.setValueAtTime(880, context.currentTime + 0.12);
-      gain.gain.setValueAtTime(0.0001, context.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.12, context.currentTime + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.32);
-      oscillator.connect(gain); gain.connect(context.destination);
-      oscillator.start(); oscillator.stop(context.currentTime + 0.34);
-      window.setTimeout(() => context.close(), 500);
-    } catch { /* Sound remains controlled by the operating system. */ }
-  }, []);
-
-  const checkReminders = useCallback(async () => {
-    if (permission !== "granted") return;
-    const due = entries.filter((entry) => entryIsDue(entry));
-    if (!due.length) return;
-    const notified: string[] = JSON.parse(localStorage.getItem(NOTIFIED_KEY) ?? "[]");
-    for (const entry of due) {
-      const stamp = `${entry.id}:${entry.type === "task" ? `${entry.date}-${entry.time ?? "day"}` : entry.revisitDate}`;
-      if (notified.includes(stamp)) continue;
-      const title = entry.type === "task" ? "Пора выполнить задачу" : "Пора вернуться к идее";
-      try {
-        const registration = await navigator.serviceWorker.ready;
-        const icon = new URL("icons/icon-192.png", document.baseURI).pathname;
-        await registration.showNotification(title, { body: entry.text, icon, badge: icon, tag: stamp });
-        playReminderSound();
-        notified.push(stamp);
-      } catch { /* Today screen still shows the reminder. */ }
-    }
-    localStorage.setItem(NOTIFIED_KEY, JSON.stringify(notified.slice(-200)));
-  }, [entries, permission, playReminderSound]);
-
-  useEffect(() => {
-    checkReminders();
-    const timer = window.setInterval(checkReminders, 30000);
-    return () => window.clearInterval(timer);
-  }, [checkReminders]);
 
   const openScreen = (next: Screen) => { setPreviousScreen(screen); setScreen(next); window.scrollTo({ top: 0, behavior: "smooth" }); };
   const openCreate = () => openScreen("create");
@@ -191,13 +144,16 @@ export default function NotesApp() {
     if (editorType === "task" && !draftDate) { setToast("Выберите дату задачи"); return; }
     const now = new Date().toISOString();
     if (editingId) {
-      persistEntries((current) => current.map((entry) => entry.id === editingId ? {
-        ...entry, type: editorType, text, date: editorType === "task" ? draftDate : undefined,
+      const original = entries.find((entry) => entry.id === editingId);
+      const updated: Entry | null = original ? {
+        ...original, type: editorType, text, date: editorType === "task" ? draftDate : undefined,
         time: editorType === "task" && draftTime ? draftTime : undefined,
-        revisitDate: editorType === "idea" ? (entry.revisitDate ?? ideaRevisitDate(new Date(entry.createdAt))) : undefined,
-        reviewedAt: editorType === "idea" ? entry.reviewedAt : undefined,
+        revisitDate: editorType === "idea" ? (original.revisitDate ?? ideaRevisitDate(new Date(original.createdAt))) : undefined,
+        reviewedAt: editorType === "idea" ? original.reviewedAt : undefined,
         updatedAt: now,
-      } : entry));
+      } : null;
+      persistEntries((current) => current.map((entry) => entry.id === editingId && updated ? updated : entry));
+      if (updated?.type === "task" && getDeviceToken()) syncEntry(updated).catch(() => undefined);
       setSelectedId(editingId); setToast("Изменения сохранены"); setScreen("details");
     } else {
       const entry: Entry = {
@@ -207,12 +163,14 @@ export default function NotesApp() {
         revisitDate: editorType === "idea" ? ideaRevisitDate() : undefined,
       };
       persistEntries((current) => [entry, ...current]);
+      if (entry.type === "task" && getDeviceToken()) syncEntry(entry).catch(() => undefined);
       setToast(`${TYPE_LABELS[editorType]} сохранена`); setScreen("today");
     }
   };
 
   const deleteEntry = () => {
     if (!selectedEntry) return;
+    if (getDeviceToken()) deleteRemoteEntry(selectedEntry.sourceTaskId ?? selectedEntry.id).catch(() => undefined);
     persistEntries((current) => current.filter((entry) => entry.id !== selectedEntry.id));
     setConfirmDelete(false); setSelectedId(null); setToast("Запись удалена"); setScreen("records");
   };
@@ -222,6 +180,10 @@ export default function NotesApp() {
     persistEntries((current) => current.map((item) => item.id === entry.id ? {
       ...item, status: completed ? "completed" : "active", completedAt: completed ? new Date().toISOString() : undefined, updatedAt: new Date().toISOString(),
     } : item));
+    if (getDeviceToken()) {
+      if (completed) cancelRemoteReminder(entry.sourceTaskId ?? entry.id).catch(() => undefined);
+      else syncEntry({ ...entry, id: entry.sourceTaskId ?? entry.id, status: "active", completedAt: undefined }).catch(() => undefined);
+    }
     setToast(completed ? "Задача выполнена" : "Задача снова активна");
   };
 
@@ -247,20 +209,9 @@ export default function NotesApp() {
     try { recognition.start(); } catch { setSpeechState("error"); }
   };
 
-  const enableNotifications = async () => {
-    if (!("Notification" in window)) { setPermission("unsupported"); setReminderInfo(true); return; }
-    const result = await Notification.requestPermission(); setPermission(result); setReminderInfo(true);
-    if (result === "granted") { setToast("Напоминания включены"); playReminderSound(); }
-  };
-
-  const installApp = async () => {
-    if (!installPrompt) { setReminderInfo(true); return; }
-    const prompt = installPrompt as Event & { prompt(): Promise<void> };
-    await prompt.prompt(); setInstallPrompt(null);
-  };
-
   const todayTasks = sortEntries(entries.filter((entry) => entry.type === "task" && entry.status === "active" && entry.date && entry.date <= today));
   const dueIdeas = sortEntries(entries.filter((entry) => entry.type === "idea" && entry.status === "active" && !entry.reviewedAt && entry.revisitDate && entry.revisitDate <= today));
+  const birthdayAlerts = birthdays.map((birthday) => ({ birthday, state: birthdayReminderState(birthday) })).filter((item): item is { birthday: Birthday; state: "today" | "tomorrow" } => Boolean(item.state));
   const filteredEntries = sortEntries(entries.filter((entry) => {
     if (filter === "all") return entry.status === "active";
     if (filter === "completed") return entry.type === "task" && entry.status === "completed";
@@ -278,6 +229,17 @@ export default function NotesApp() {
   }, [calendarMonth]);
   const datesWithTasks = new Set(entries.filter((entry) => entry.type === "task" && entry.date).map((entry) => entry.date as string));
   const calendarEntries = sortEntries(entries.filter((entry) => entry.type === "task" && entry.date === calendarDate));
+  const calendarBirthdays = birthdaysForDate(birthdays, calendarDate);
+  const calendarYear = Number(calendarDate.slice(0, 4));
+
+  const acceptPlannedEntries = (planned: Entry[]) => persistEntries((current) => [...current, ...planned]);
+  const applyCalendarChanges = (changes: Array<{ localId: string; text: string; date: string; time?: string; cancelled?: boolean }>) => {
+    persistEntries((current) => current.map((entry) => {
+      const change = changes.find((item) => item.localId === entry.sourceTaskId || item.localId === entry.id);
+      if (!change) return entry;
+      return { ...entry, text: change.text, date: change.date, time: change.time, status: change.cancelled ? "completed" : entry.status, updatedAt: new Date().toISOString() };
+    }));
+  };
 
   return (
     <main className="app-shell">
@@ -286,8 +248,12 @@ export default function NotesApp() {
           <section className="screen" aria-labelledby="today-title">
             <header className="page-header">
               <div><h1 id="today-title">Сегодня</h1><p className="date-heading">{formatLongDate(new Date())}</p></div>
-              <button className="icon-button" onClick={() => setReminderInfo(true)} aria-label="Настройки напоминаний"><Settings2 /></button>
+              <button className="icon-button" onClick={() => openScreen("assistant")} aria-label="Открыть личного помощника"><Settings2 /></button>
             </header>
+
+            <button className="assistant-today-card" onClick={() => openScreen("assistant")}><span className="assistant-hero-icon"><Sparkles /></span><span><strong>Личный помощник</strong><small>Цели, дни рождения и Telegram-напоминания</small></span><ChevronRight /></button>
+
+            {birthdayAlerts.length > 0 && <section className="section-block" aria-labelledby="birthdays-today-title"><div className="section-heading"><span className="section-icon"><Gift /></span><h2 id="birthdays-today-title">Дни рождения</h2><span className="count-badge">{birthdayAlerts.length}</span></div><div className="card-stack">{birthdayAlerts.map(({ birthday, state }) => <div className={`birthday-alert ${state === "today" ? "is-today" : ""}`} key={birthday.id}><Gift /><div><strong>{state === "today" ? `Сегодня день рождения: ${birthday.name}` : `Завтра день рождения: ${birthday.name}`}</strong><span>{state === "today" ? "Самое время поздравить" : "Можно заранее подготовиться"}</span></div></div>)}</div></section>}
 
             <section className="section-block" aria-labelledby="tasks-title">
               <div className="section-heading"><span className="section-icon"><ClipboardList /></span><h2 id="tasks-title">Задачи</h2><span className="count-badge">{todayTasks.length}</span></div>
@@ -360,11 +326,13 @@ export default function NotesApp() {
             <div className="calendar-card">
               <div className="calendar-head"><button className="icon-button bare" onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1))} aria-label="Предыдущий месяц"><ChevronLeft /></button><h2>{new Intl.DateTimeFormat("ru-RU", { month: "long", year: "numeric" }).format(calendarMonth)}</h2><button className="icon-button bare" onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1))} aria-label="Следующий месяц"><ChevronRight /></button></div>
               <div className="weekdays" aria-hidden="true">{["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].map((day) => <span key={day}>{day}</span>)}</div>
-              <div className="calendar-grid">{calendarCells.map((cell, index) => cell ? <button key={cell.date} className={`${cell.date === today ? "today" : ""} ${cell.date === calendarDate ? "selected" : ""}`} onClick={() => setCalendarDate(cell.date)} aria-label={formatDateKey(cell.date)} aria-pressed={cell.date === calendarDate}><span>{cell.day}</span>{datesWithTasks.has(cell.date) && <i aria-label="Есть задачи" />}</button> : <span key={`empty-${index}`} />)}</div>
+              <div className="calendar-grid">{calendarCells.map((cell, index) => cell ? <button key={cell.date} className={`${cell.date === today ? "today" : ""} ${cell.date === calendarDate ? "selected" : ""}`} onClick={() => setCalendarDate(cell.date)} aria-label={formatDateKey(cell.date)} aria-pressed={cell.date === calendarDate}><span>{cell.day}</span>{(datesWithTasks.has(cell.date) || birthdaysForDate(birthdays, cell.date).length > 0) && <i aria-label="Есть записи" />}</button> : <span key={`empty-${index}`} />)}</div>
             </div>
-            <section className="section-block calendar-list"><div className="section-heading"><h2>{formatDateKey(calendarDate)}</h2><span className="count-badge">{calendarEntries.length}</span></div>{calendarEntries.length ? <div className="card-stack">{calendarEntries.map((entry) => <EntryCard key={entry.id} entry={entry} today={today} onOpen={openEntry} />)}</div> : <div className="empty-card"><CalendarDays /><strong>Задач нет</strong><span>Можно запланировать новую на эту дату.</span></div>}<button className="secondary-button full" onClick={() => { setEditorType("task"); setDraftText(""); setDraftDate(calendarDate); setDraftTime(""); setEditingId(null); openScreen("editor"); }}><Plus />Добавить задачу</button></section>
+            <section className="section-block calendar-list"><div className="section-heading"><h2>{formatDateKey(calendarDate)}</h2><span className="count-badge">{calendarEntries.length + calendarBirthdays.length}</span></div>{calendarBirthdays.length > 0 && <div className="card-stack birthday-calendar-list">{calendarBirthdays.map((birthday) => <div className="birthday-alert" key={birthday.id}><Gift /><div><strong>День рождения: {birthday.name}</strong><span>{birthday.year ? `Исполнится ${calendarYear - birthday.year}` : "Повторяется ежегодно"}</span></div></div>)}</div>}{calendarEntries.length ? <div className="card-stack">{calendarEntries.map((entry) => <EntryCard key={entry.id} entry={entry} today={today} onOpen={openEntry} />)}</div> : calendarBirthdays.length === 0 && <div className="empty-card"><CalendarDays /><strong>Задач нет</strong><span>Можно запланировать новую на эту дату.</span></div>}<button className="secondary-button full" onClick={() => { setEditorType("task"); setDraftText(""); setDraftDate(calendarDate); setDraftTime(""); setEditingId(null); openScreen("editor"); }}><Plus />Добавить задачу</button></section>
           </section>
         )}
+
+        {screen === "assistant" && <AssistantScreen entries={entries} onBack={() => setScreen("today")} onAcceptEntries={acceptPlannedEntries} onBirthdaysChange={setBirthdays} onApplyCalendarChanges={applyCalendarChanges} onMessage={setToast} />}
 
         {screen === "details" && selectedEntry && (
           <section className="screen" aria-labelledby="details-title">
@@ -388,7 +356,6 @@ export default function NotesApp() {
 
       {toast && <div className="toast" role="status"><CheckCircle2 />{toast}</div>}
       {confirmDelete && <Modal title="Удалить запись?" onClose={() => setConfirmDelete(false)}><p>Запись исчезнет с этого устройства. Отменить удаление будет нельзя.</p><div className="modal-actions"><button className="secondary-button" onClick={() => setConfirmDelete(false)}>Оставить</button><button className="danger-button" onClick={deleteEntry}><Trash2 />Удалить</button></div></Modal>}
-      {reminderInfo && <Modal title="Напоминания" onClose={() => setReminderInfo(false)}><div className="modal-copy"><p><strong>Данные остаются на устройстве.</strong> Приложение проверяет сроки, пока оно открыто, и всегда показывает их на экране «Сегодня».</p><p>Уведомления и звук зависят от браузера и настроек телефона. На iPhone установите приложение на экран «Домой» и разрешите уведомления; iOS может не запускать локальные напоминания, когда приложение полностью закрыто.</p></div><div className="modal-actions vertical"><button className="primary-button" onClick={enableNotifications} disabled={permission === "granted"}><Bell />{permission === "granted" ? "Уведомления разрешены" : permission === "denied" ? "Разрешение отключено" : "Разрешить уведомления"}</button><button className="secondary-button" onClick={installApp}><Plus />Установить приложение</button></div>{permission === "denied" && <p className="permission-note">Откройте настройки сайта в браузере и включите уведомления вручную.</p>}</Modal>}
     </main>
   );
 }
