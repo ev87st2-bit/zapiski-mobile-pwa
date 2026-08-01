@@ -11,3 +11,4 @@ dist-pages/
 Thumbs.db
 playwright-report/
 test-results/
+*.tsbuildinfo
