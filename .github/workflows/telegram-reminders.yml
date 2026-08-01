@@ -1,0 +1,30 @@
+name: Check Telegram reminders
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-reminders
+  cancel-in-progress: false
+
+jobs:
+  send-due-reminders:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Send due Telegram reminders
+        env:
+          REMINDER_ENDPOINT: https://zapiski-mobile-pwa.ev87st-2.chatgpt.site/api/cron
+          REMINDER_CRON_SECRET: ${{ secrets.REMINDER_CRON_SECRET }}
+        run: |
+          test -n "$REMINDER_CRON_SECRET"
+          curl --fail --silent --show-error \
+            --retry 2 \
+            --request POST \
+            --header "Authorization: Bearer $REMINDER_CRON_SECRET" \
+            "$REMINDER_ENDPOINT"
